@@ -1,0 +1,22 @@
+[package]
+name = "email-client-tui-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+color-eyre = "0.6"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+crossterm = "0.29"
+dirs = "6.0"
+fuzzy-matcher = "0.3"
+imap = "2.4"
+lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "native-tls", "pool", "smtp-transport"] }
+mailparse = "0.15"
+native-tls = "0.2"
+oauth2 = { version = "5.0.0", default-features = false, features = ["reqwest-blocking", "native-tls"] }
+ratatui = "0.29"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+url = "2.5"

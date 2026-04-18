@@ -1,0 +1,38 @@
+# Copy this file to:
+#   ~/.config/email-client-tui-rs/config.toml
+#
+# Gmail and Outlook can now be authorized in-app with `o` or `:authorize-account`.
+# If you prefer password auth instead, Gmail usually needs an App Password and
+# Outlook basic auth is commonly blocked.
+
+default_account = "personal"
+
+[[accounts]]
+name = "personal"
+provider = "gmail"
+email = "you@gmail.com"
+display_name = "Your Name"
+password_env = "GMAIL_APP_PASSWORD"
+
+[[accounts]]
+name = "work"
+provider = "outlook"
+email = "you@outlook.com"
+password_command = "pass show mail/work-outlook-app-password"
+
+[[accounts]]
+name = "custom"
+provider = "custom"
+email = "you@example.com"
+login = "imap-user"
+password_env = "CUSTOM_MAIL_PASSWORD"
+folders = ["INBOX", "Sent", "Drafts", "Archive", "Trash"]
+
+[accounts.imap]
+host = "imap.example.com"
+port = 993
+
+[accounts.smtp]
+host = "smtp.example.com"
+port = 587
+tls_mode = "starttls"
