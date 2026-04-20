@@ -2,7 +2,13 @@ use std::cmp;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver},
+};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::Local;
@@ -15,6 +21,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
+use crate::cache;
 use crate::command::{AppCommand, CommandMatch, search_commands};
 use crate::config::{
     AccountConfig, AppConfig, ImapOverride, LoadedConfig, OAuthConfig, OAuthProviderKind,
@@ -22,27 +29,37 @@ use crate::config::{
 };
 use crate::mail::{
     AuthorizedAccount, EmailDraft, EmailMessage, MailClient, OAuthAuthorizeRequest,
-    OAuthAuthorizeUpdate, StoredOAuthClient, find_google_desktop_oauth_client,
-    load_provider_oauth_client, load_saved_oauth_client, save_provider_oauth_client,
-    start_authorize_worker,
+    OAuthAuthorizeUpdate, StoredOAuthClient, SyncBatch, find_google_desktop_oauth_client,
+    load_provider_oauth_client, load_saved_oauth_client, merge_messages_newest_first,
+    oldest_loaded_uid, save_provider_oauth_client, start_authorize_worker,
 };
 
-const DEFAULT_FETCH_LIMIT: usize = 25;
+const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(300);
+const LONG_TOKEN_BREAK_CHARS: usize = 32;
+const MESSAGE_ROW_HEIGHT: u16 = 3;
+const SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 
 pub struct App {
     config: AppConfig,
     config_path: PathBuf,
+    cache_root: PathBuf,
     accounts: Vec<AccountState>,
     selected_account: usize,
+    next_auto_account: usize,
     focus: Pane,
     mode: Mode,
     command_input: String,
     command_matches: Vec<CommandMatch>,
     command_index: usize,
+    reader_scroll: u16,
     compose: ComposeState,
     account_setup: AccountSetupState,
     oauth_setup: OAuthSetupState,
     confirm_delete: ConfirmDeleteState,
+    sync_receiver: Option<Receiver<SyncWorkerResult>>,
+    sync_job: Option<SyncJob>,
+    last_auto_sync: Instant,
+    animation_frame: usize,
     hitboxes: UiHitboxes,
     pending_g: bool,
     status: String,
@@ -54,6 +71,7 @@ enum Mode {
     Normal,
     Command,
     Compose,
+    Reader,
     Search,
     AccountSetup,
     AccountOAuth,
@@ -72,10 +90,33 @@ struct AccountState {
     config: ResolvedAccountConfig,
     selected_folder: usize,
     selected_message: usize,
+    message_scroll: usize,
     synced_folder: Option<String>,
     messages: Vec<EmailMessage>,
     message_query: String,
     last_sync: Option<String>,
+}
+
+struct SyncJob {
+    account_name: String,
+    requested_folder: String,
+    reason: SyncReason,
+}
+
+struct SyncWorkerResult {
+    account_index: usize,
+    account_name: String,
+    requested_folder: String,
+    reason: SyncReason,
+    result: std::result::Result<SyncBatch, String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncReason {
+    Manual,
+    Auto,
+    SentCopy,
+    LoadOlder,
 }
 
 #[derive(Default)]
@@ -130,6 +171,7 @@ struct OAuthSetupState {
     progress_message: String,
     auth_url: String,
     receiver: Option<Receiver<OAuthAuthorizeUpdate>>,
+    cancellation: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -231,7 +273,11 @@ struct ConfirmDeleteState {
 impl App {
     pub fn new(loaded: LoadedConfig) -> Result<Self> {
         let config = loaded.config;
-        let (accounts, selected_account) = resolve_accounts(&config)?;
+        let cache_root = cache::cache_root(&loaded.path);
+        let (mut accounts, selected_account) = resolve_accounts(&config)?;
+        for account in &mut accounts {
+            load_cached_folder_into_state(&cache_root, account);
+        }
         let command_matches = search_commands("");
         let status = if accounts.is_empty() {
             format!(
@@ -248,17 +294,24 @@ impl App {
         Ok(Self {
             config,
             config_path: loaded.path,
+            cache_root,
             accounts,
             selected_account,
+            next_auto_account: 0,
             focus: Pane::Accounts,
             mode: Mode::Normal,
             command_input: String::new(),
             command_matches,
             command_index: 0,
+            reader_scroll: 0,
             compose: ComposeState::default(),
             account_setup: AccountSetupState::default(),
             oauth_setup: OAuthSetupState::default(),
             confirm_delete: ConfirmDeleteState::default(),
+            sync_receiver: None,
+            sync_job: None,
+            last_auto_sync: Instant::now(),
+            animation_frame: 0,
             hitboxes: UiHitboxes::default(),
             pending_g: false,
             status,
@@ -288,6 +341,10 @@ impl App {
             self.draw_compose(frame);
         }
 
+        if self.mode == Mode::Reader {
+            self.draw_message_reader(frame);
+        }
+
         if self.mode == Mode::Search {
             self.draw_search_popup(frame);
         }
@@ -305,11 +362,20 @@ impl App {
         }
     }
 
+    pub fn tick(&mut self) {
+        self.poll_sync_updates();
+        self.maybe_start_auto_sync();
+        if self.is_busy() {
+            self.animation_frame = self.animation_frame.wrapping_add(1);
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         match self.mode {
             Mode::Normal => self.handle_normal_mode(key),
             Mode::Command => self.handle_command_mode(key),
             Mode::Compose => self.handle_compose_mode(key),
+            Mode::Reader => self.handle_reader_mode(key),
             Mode::Search => self.handle_search_mode(key),
             Mode::AccountSetup => self.handle_account_setup_mode(key),
             Mode::AccountOAuth => self.handle_account_oauth_mode(key),
@@ -333,6 +399,7 @@ impl App {
             Mode::AccountSetup => self.handle_account_setup_click(mouse),
             Mode::AccountOAuth => self.handle_account_oauth_click(mouse),
             Mode::Compose => self.handle_compose_click(mouse),
+            Mode::Reader => Ok(()),
             Mode::Command => self.handle_command_click(mouse),
             Mode::Search => self.handle_search_click(mouse),
             Mode::ConfirmDeleteAccount => self.handle_confirm_delete_click(mouse),
@@ -346,6 +413,10 @@ impl App {
             Mode::Command => self.handle_command_scroll(mouse, delta),
             Mode::Compose => {
                 self.handle_compose_scroll(mouse, delta);
+                Ok(())
+            }
+            Mode::Reader => {
+                self.scroll_reader(delta, 3);
                 Ok(())
             }
             Mode::Search => {
@@ -367,6 +438,14 @@ impl App {
 
     pub fn set_status(&mut self, status: String) {
         self.status = status;
+    }
+
+    fn is_busy(&self) -> bool {
+        self.sync_job.is_some() || self.oauth_setup.running
+    }
+
+    fn spinner(&self) -> &'static str {
+        SPINNER_FRAMES[self.animation_frame % SPINNER_FRAMES.len()]
     }
 
     fn draw_main(&mut self, frame: &mut Frame, area: Rect) {
@@ -401,7 +480,7 @@ impl App {
             })
             .unwrap_or_else(|| "no account".to_owned());
 
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled(
                 " mail-tui ",
                 Style::new()
@@ -416,6 +495,33 @@ impl App {
                     .bg(Color::Rgb(233, 196, 106))
                     .add_modifier(Modifier::BOLD),
             ),
+        ];
+
+        if let Some(job) = &self.sync_job {
+            spans.push(Span::styled(
+                format!(
+                    " {}:{} {}:{} ",
+                    sync_reason_label(job.reason),
+                    self.spinner(),
+                    job.account_name,
+                    job.requested_folder
+                ),
+                Style::new()
+                    .fg(Color::Rgb(15, 23, 42))
+                    .bg(Color::Rgb(163, 230, 53))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if self.oauth_setup.running {
+            spans.push(Span::styled(
+                format!(" oauth:{} ", self.spinner()),
+                Style::new()
+                    .fg(Color::Rgb(15, 23, 42))
+                    .bg(Color::Rgb(163, 230, 53))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        spans.extend([
             Span::styled(
                 format!(" account:{account_label} "),
                 Style::new()
@@ -423,10 +529,12 @@ impl App {
                     .bg(Color::Rgb(45, 55, 72)),
             ),
             Span::styled(
-                " vim: h/l or Tab focus, j/k move, a account, o auth, : palette, c compose ",
+                " vim: h/l or Tab focus, j/k move, s sync, m older, a account, o auth, : palette, c compose ",
                 Style::new().fg(Color::Rgb(148, 163, 184)),
             ),
-        ])
+        ]);
+
+        Line::from(spans)
     }
 
     fn status_bar(&self) -> Line<'_> {
@@ -440,7 +548,13 @@ impl App {
                 .bg(Color::Rgb(30, 41, 59))
         };
 
-        Line::from(self.status.clone()).style(style)
+        let text = if self.is_busy() && !self.status.starts_with("Error:") {
+            format!("{} {}", self.spinner(), self.status)
+        } else {
+            self.status.clone()
+        };
+
+        Line::from(text).style(style)
     }
 
     fn draw_accounts(&self, frame: &mut Frame, area: Rect) {
@@ -469,6 +583,18 @@ impl App {
                                 .style(Style::new().fg(Color::Rgb(163, 230, 53))),
                         );
                     }
+                    if let Some(job) = &self.sync_job
+                        && job.account_name == account.config.name
+                    {
+                        lines.push(
+                            Line::from(format!(
+                                "{} syncing {}",
+                                self.spinner(),
+                                job.requested_folder
+                            ))
+                            .style(Style::new().fg(Color::Rgb(250, 204, 21))),
+                        );
+                    }
                     ListItem::new(lines)
                 })
                 .collect()
@@ -493,7 +619,17 @@ impl App {
                     .config
                     .folders
                     .iter()
-                    .map(|folder| ListItem::new(folder.clone()))
+                    .map(|folder| {
+                        let label = if self.sync_job.as_ref().is_some_and(|job| {
+                            job.account_name == account.config.name
+                                && folder.eq_ignore_ascii_case(&job.requested_folder)
+                        }) {
+                            format!("{} {}", self.spinner(), folder)
+                        } else {
+                            folder.clone()
+                        };
+                        ListItem::new(label)
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_else(|| vec![ListItem::new("No folders")]);
@@ -560,6 +696,13 @@ impl App {
         let mut state = ListState::default();
         if let Some(account) = self.current_account() {
             if account.filtered_message_count() > 0 {
+                let offset = message_scroll_for_selection(
+                    account.message_scroll,
+                    account.selected_message,
+                    account.filtered_message_count(),
+                    self.message_visible_count(),
+                );
+                *state.offset_mut() = offset;
                 state.select(Some(account.selected_message));
             }
         }
@@ -568,28 +711,7 @@ impl App {
 
     fn draw_preview(&self, frame: &mut Frame, area: Rect) {
         let text = if let Some(message) = self.selected_message() {
-            Text::from(vec![
-                Line::from(vec![
-                    "From: "
-                        .fg(Color::Rgb(94, 234, 212))
-                        .add_modifier(Modifier::BOLD),
-                    message.from.clone().into(),
-                ]),
-                Line::from(vec![
-                    "Date: "
-                        .fg(Color::Rgb(125, 211, 252))
-                        .add_modifier(Modifier::BOLD),
-                    message.date.clone().into(),
-                ]),
-                Line::from(vec![
-                    "Seq: "
-                        .fg(Color::Rgb(250, 204, 21))
-                        .add_modifier(Modifier::BOLD),
-                    message.id.to_string().into(),
-                ]),
-                Line::from(""),
-                Line::from(message.body.clone()),
-            ])
+            message_text(message, false)
         } else if self.accounts.is_empty() {
             Text::from(vec![
                 Line::from("Add an account in-app with `a` or edit:"),
@@ -610,6 +732,31 @@ impl App {
 
         let paragraph = Paragraph::new(text)
             .block(self.pane_block("Preview", Pane::Preview))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, area);
+    }
+
+    fn draw_message_reader(&self, frame: &mut Frame) {
+        let area = frame.area();
+        frame.render_widget(Clear, area);
+
+        let Some(message) = self.selected_message() else {
+            frame.render_widget(
+                Paragraph::new("No message selected.")
+                    .block(reader_block("Reader"))
+                    .wrap(Wrap { trim: false }),
+                area,
+            );
+            return;
+        };
+
+        let title = format!(
+            "Reader: {}   Esc/q close   j/k/wheel scroll   PgUp/PgDn page",
+            truncate_title(&message.subject, 72)
+        );
+        let paragraph = Paragraph::new(message_text(message, true))
+            .block(reader_block(&title))
+            .scroll((self.reader_scroll, 0))
             .wrap(Wrap { trim: false });
         frame.render_widget(paragraph, area);
     }
@@ -1122,8 +1269,9 @@ impl App {
             .unwrap_or("oauth");
         let header = if self.oauth_setup.running {
             format!(
-                " Authorize {}   Waiting for browser callback ",
-                provider_label
+                " Authorize {}   {} Waiting for browser callback   Esc/q/Cancel closes ",
+                provider_label,
+                self.spinner()
             )
         } else {
             format!(
@@ -1202,9 +1350,9 @@ impl App {
         );
 
         let start_label = if self.oauth_setup.running {
-            "Authorizing..."
+            format!("{} Authorizing...", self.spinner())
         } else {
-            "Open Browser"
+            "Open Browser".to_owned()
         };
         frame.render_widget(
             Paragraph::new(start_label).block(confirm_block(
@@ -1315,18 +1463,16 @@ impl App {
 
         if rect_contains(self.hitboxes.messages, x, y) {
             self.focus = Pane::Messages;
-            if let Some(index) = list_index_from_click(
-                inner_rect(self.hitboxes.messages),
-                y,
-                &self.message_row_heights(),
-            ) {
+            if let Some(index) = self.message_index_from_click(y) {
                 self.set_message_selection(index);
+                self.enter_reader_mode();
             }
             return Ok(());
         }
 
         if rect_contains(self.hitboxes.preview, x, y) {
             self.focus = Pane::Preview;
+            self.enter_reader_mode();
         }
 
         Ok(())
@@ -1413,11 +1559,7 @@ impl App {
 
         if rect_contains(self.hitboxes.messages, mouse.column, mouse.row) {
             self.focus = Pane::Messages;
-            if let Some(index) = list_index_from_click(
-                inner_rect(self.hitboxes.messages),
-                mouse.row,
-                &self.message_row_heights(),
-            ) {
+            if let Some(index) = self.message_index_from_click(mouse.row) {
                 self.set_message_selection(index);
             }
         }
@@ -1497,13 +1639,22 @@ impl App {
     }
 
     fn handle_account_oauth_click(&mut self, mouse: MouseEvent) -> Result<()> {
-        if self.oauth_setup.running {
-            return Ok(());
-        }
-
         let Some(hitboxes) = self.hitboxes.oauth_setup.clone() else {
             return Ok(());
         };
+
+        if rect_contains(hitboxes.cancel, mouse.column, mouse.row)
+            || !rect_contains(hitboxes.dialog, mouse.column, mouse.row)
+        {
+            self.close_account_oauth(
+                "Account OAuth cancelled. Close the browser tab if it is still open.",
+            );
+            return Ok(());
+        }
+
+        if self.oauth_setup.running {
+            return Ok(());
+        }
 
         if rect_contains(hitboxes.client_id, mouse.column, mouse.row) {
             self.oauth_setup.field = OAuthField::ClientId;
@@ -1512,10 +1663,6 @@ impl App {
         } else if rect_contains(hitboxes.start, mouse.column, mouse.row) {
             self.oauth_setup.field = OAuthField::Start;
             self.start_account_oauth()?;
-        } else if rect_contains(hitboxes.cancel, mouse.column, mouse.row)
-            || !rect_contains(hitboxes.dialog, mouse.column, mouse.row)
-        {
-            self.close_account_oauth("Account OAuth cancelled.");
         }
 
         Ok(())
@@ -1644,6 +1791,7 @@ impl App {
             KeyCode::Char('c') => self.enter_compose_mode(),
             KeyCode::Char('/') => self.enter_search_mode(),
             KeyCode::Char('s') => self.sync_current_account()?,
+            KeyCode::Char('m') => self.load_older_current_folder()?,
             KeyCode::Tab => self.focus = self.focus.next(),
             KeyCode::BackTab => self.focus = self.focus.previous(),
             KeyCode::Char('h') | KeyCode::Left => self.focus = self.focus.previous(),
@@ -1664,11 +1812,41 @@ impl App {
             }
             KeyCode::Enter => {
                 self.pending_g = false;
-                if self.focus == Pane::Folders {
-                    self.sync_current_account()?;
+                match self.focus {
+                    Pane::Accounts => {
+                        self.focus = Pane::Folders;
+                        self.status = "Folders focused.".to_owned();
+                    }
+                    Pane::Folders => {
+                        self.sync_current_account()?;
+                        self.focus = Pane::Messages;
+                    }
+                    Pane::Messages | Pane::Preview => {
+                        self.enter_reader_mode();
+                    }
                 }
             }
             _ => self.pending_g = false,
+        }
+
+        Ok(())
+    }
+
+    fn handle_reader_mode(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = Mode::Normal;
+                self.status = "Closed message reader.".to_owned();
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_reader(1, 1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_reader(-1, 1),
+            KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Char('l') => {
+                self.scroll_reader(1, 12)
+            }
+            KeyCode::PageUp | KeyCode::Char('h') => self.scroll_reader(-1, 12),
+            KeyCode::Char('g') => self.reader_scroll = 0,
+            KeyCode::Char('G') => self.reader_scroll = u16::MAX,
+            _ => {}
         }
 
         Ok(())
@@ -1733,12 +1911,14 @@ impl App {
     }
 
     fn handle_account_oauth_mode(&mut self, key: KeyEvent) -> Result<()> {
-        if self.oauth_setup.running {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            self.close_account_oauth(
+                "Account OAuth cancelled. Close the browser tab if it is still open.",
+            );
             return Ok(());
         }
 
-        if key.code == KeyCode::Esc {
-            self.close_account_oauth("Account OAuth cancelled.");
+        if self.oauth_setup.running {
             return Ok(());
         }
 
@@ -1786,9 +1966,11 @@ impl App {
                 };
             }
             KeyCode::Backspace => {
+                let visible_count = self.message_visible_count();
                 if let Some(account) = self.current_account_mut() {
                     account.message_query.pop();
                     account.clamp_selected_message();
+                    account.sync_message_scroll(visible_count);
                 }
             }
             KeyCode::Down => {
@@ -1800,9 +1982,11 @@ impl App {
                 self.move_message_selection(-1);
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let visible_count = self.message_visible_count();
                 if let Some(account) = self.current_account_mut() {
                     account.message_query.push(ch);
                     account.clamp_selected_message();
+                    account.sync_message_scroll(visible_count);
                 }
             }
             _ => {}
@@ -1893,6 +2077,7 @@ impl App {
     fn run_command(&mut self, command: AppCommand) -> Result<()> {
         match command {
             AppCommand::Sync => self.sync_current_account(),
+            AppCommand::LoadOlder => self.load_older_current_folder(),
             AppCommand::AddAccount => {
                 self.enter_account_setup_mode();
                 Ok(())
@@ -1951,37 +2136,313 @@ impl App {
     }
 
     fn sync_current_account(&mut self) -> Result<()> {
-        let index = self.selected_account;
-        let account = self
-            .accounts
-            .get(index)
-            .map(|account| (account.config.clone(), account.current_folder().to_owned()))
-            .ok_or_else(|| anyhow::anyhow!("no account selected"))?;
+        self.start_sync_for_account(self.selected_account, None, SyncReason::Manual)
+    }
 
-        let messages = MailClient::sync_folder(&account.0, &account.1, DEFAULT_FETCH_LIMIT)?;
-        let synced_at = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    fn load_older_current_folder(&mut self) -> Result<()> {
+        self.start_sync_for_account(self.selected_account, None, SyncReason::LoadOlder)
+    }
+
+    fn start_sync_for_account(
+        &mut self,
+        account_index: usize,
+        folder_override: Option<String>,
+        reason: SyncReason,
+    ) -> Result<()> {
+        if let Some(job) = &self.sync_job {
+            self.status = format!(
+                "Sync already running for {} / {}.",
+                job.account_name, job.requested_folder
+            );
+            return Ok(());
+        }
 
         let account_state = self
             .accounts
-            .get_mut(index)
-            .expect("selected account must exist while syncing");
-        account_state.messages = messages;
-        account_state.selected_message = 0;
-        account_state.synced_folder = Some(account.1.clone());
-        account_state.last_sync = Some(synced_at.clone());
+            .get(account_index)
+            .ok_or_else(|| anyhow::anyhow!("no account selected"))?;
+        let account = account_state.config.clone();
+        let requested_folder =
+            folder_override.unwrap_or_else(|| account_state.current_folder().to_owned());
+        let before_uid = if reason == SyncReason::LoadOlder {
+            match oldest_loaded_uid(&account_state.messages) {
+                Some(uid) => Some(uid),
+                None => {
+                    self.status = "Sync this folder before loading older messages.".to_owned();
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+        let fetch_limit = self.config.fetch_limit();
+        let account_name = account.name.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker_account_name = account_name.clone();
+        let worker_requested_folder = requested_folder.clone();
 
-        self.focus = Pane::Messages;
-        self.status = format!(
-            "Synced {} message(s) from {} / {} at {}.",
-            account_state.messages.len(),
-            account_state.config.name,
-            account.1,
-            synced_at
-        );
+        thread::spawn(move || {
+            let result = match before_uid {
+                Some(uid) => {
+                    MailClient::load_older(&account, &worker_requested_folder, uid, fetch_limit)
+                        .map(|synced| SyncBatch {
+                            folders: vec![],
+                            synced_folders: vec![synced],
+                        })
+                }
+                None => MailClient::sync_folders(&account, &worker_requested_folder, fetch_limit),
+            }
+            .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(SyncWorkerResult {
+                account_index,
+                account_name: worker_account_name,
+                requested_folder: worker_requested_folder,
+                reason,
+                result,
+            });
+        });
+
+        self.sync_receiver = Some(receiver);
+        self.sync_job = Some(SyncJob {
+            account_name: account_name.clone(),
+            requested_folder: requested_folder.clone(),
+            reason,
+        });
+        self.status = match reason {
+            SyncReason::Manual => {
+                format!("Syncing {} / {}...", account_name, requested_folder)
+            }
+            SyncReason::Auto => {
+                format!("Auto-syncing {} / {}...", account_name, requested_folder)
+            }
+            SyncReason::SentCopy => {
+                format!(
+                    "Refreshing {} / {} after send...",
+                    account_name, requested_folder
+                )
+            }
+            SyncReason::LoadOlder => {
+                format!(
+                    "Loading older messages from {} / {}...",
+                    account_name, requested_folder
+                )
+            }
+        };
+        Ok(())
+    }
+
+    fn poll_sync_updates(&mut self) {
+        let mut result = None;
+        if let Some(receiver) = &self.sync_receiver
+            && let Ok(update) = receiver.try_recv()
+        {
+            result = Some(update);
+        }
+
+        let Some(update) = result else {
+            return;
+        };
+
+        self.sync_receiver = None;
+        self.sync_job = None;
+
+        let SyncWorkerResult {
+            account_index,
+            account_name,
+            requested_folder,
+            reason,
+            result,
+        } = update;
+
+        match result {
+            Ok(batch) => {
+                if let Err(error) =
+                    self.finish_sync(account_index, account_name, requested_folder, reason, batch)
+                {
+                    self.status = format!("Error: {error:#}");
+                }
+            }
+            Err(error) => {
+                self.status = format!("Error: sync failed: {error}");
+            }
+        }
+    }
+
+    fn maybe_start_auto_sync(&mut self) {
+        if self.mode != Mode::Normal
+            || self.accounts.is_empty()
+            || self.sync_job.is_some()
+            || self.last_auto_sync.elapsed() < AUTO_SYNC_INTERVAL
+        {
+            return;
+        }
+
+        let index = self
+            .next_auto_account
+            .min(self.accounts.len().saturating_sub(1));
+        self.next_auto_account = if self.accounts.is_empty() {
+            0
+        } else {
+            (index + 1) % self.accounts.len()
+        };
+        self.last_auto_sync = Instant::now();
+
+        if let Err(error) = self.start_sync_for_account(index, None, SyncReason::Auto) {
+            self.status = format!("Error: auto-sync failed to start: {error:#}");
+        }
+    }
+
+    fn finish_sync(
+        &mut self,
+        account_index: usize,
+        account_name: String,
+        requested_folder: String,
+        reason: SyncReason,
+        batch: SyncBatch,
+    ) -> Result<()> {
+        if account_index >= self.accounts.len()
+            || self.accounts[account_index].config.name != account_name
+        {
+            return Ok(());
+        }
+
+        let synced_at = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        if reason != SyncReason::LoadOlder {
+            for synced in &batch.synced_folders {
+                cache::save_folder(
+                    &self.cache_root,
+                    &account_name,
+                    &synced.folder,
+                    &synced_at,
+                    &synced.messages,
+                )?;
+            }
+        }
+
+        self.apply_discovered_folders(account_index, &batch.folders)?;
+
+        let folder_to_show = match reason {
+            SyncReason::Manual | SyncReason::SentCopy | SyncReason::LoadOlder => batch
+                .synced_folders
+                .first()
+                .map(|synced| synced.folder.as_str())
+                .unwrap_or(requested_folder.as_str()),
+            SyncReason::Auto => self.accounts[account_index].current_folder(),
+        }
+        .to_owned();
+
+        if let Some(position) = matching_folder_position(
+            &self.accounts[account_index].config.folders,
+            &folder_to_show,
+        ) {
+            self.accounts[account_index].selected_folder = position;
+        }
+
+        let current_folder = self.accounts[account_index].current_folder().to_owned();
+        let mut loaded_older_count = 0;
+        if let Some(synced) = batch
+            .synced_folders
+            .iter()
+            .find(|synced| synced.folder.eq_ignore_ascii_case(current_folder.as_str()))
+        {
+            let account_state = &mut self.accounts[account_index];
+            loaded_older_count = synced.messages.len();
+            account_state.messages = if reason == SyncReason::LoadOlder {
+                merge_messages_newest_first(&account_state.messages, &synced.messages)
+            } else {
+                synced.messages.clone()
+            };
+            if reason != SyncReason::LoadOlder {
+                account_state.selected_message = 0;
+                account_state.message_scroll = 0;
+            }
+            account_state.synced_folder = Some(synced.folder.clone());
+            account_state.last_sync = Some(synced_at.clone());
+            if reason != SyncReason::LoadOlder {
+                account_state.message_query.clear();
+            }
+            if reason == SyncReason::LoadOlder {
+                cache::save_folder(
+                    &self.cache_root,
+                    &account_name,
+                    &synced.folder,
+                    &synced_at,
+                    &account_state.messages,
+                )?;
+            }
+        } else {
+            load_cached_folder_into_state(&self.cache_root, &mut self.accounts[account_index]);
+        }
+
+        if account_index == self.selected_account
+            && matches!(reason, SyncReason::Manual | SyncReason::LoadOlder)
+        {
+            self.focus = Pane::Messages;
+        }
+
+        let current = &self.accounts[account_index];
+        self.status = match reason {
+            SyncReason::Manual => format!(
+                "Synced {} message(s) from {} / {} at {}.",
+                current.messages.len(),
+                current.config.name,
+                current.current_folder(),
+                synced_at
+            ),
+            SyncReason::Auto => format!(
+                "Auto-synced {} / {} at {}.",
+                current.config.name,
+                current.current_folder(),
+                synced_at
+            ),
+            SyncReason::SentCopy => format!(
+                "Updated {} / {} after send at {}.",
+                current.config.name,
+                current.current_folder(),
+                synced_at
+            ),
+            SyncReason::LoadOlder => format!(
+                "Loaded {} older message(s) for {} / {}. {} total cached at {}.",
+                loaded_older_count,
+                current.config.name,
+                current.current_folder(),
+                current.messages.len(),
+                synced_at
+            ),
+        };
+        Ok(())
+    }
+
+    fn apply_discovered_folders(&mut self, account_index: usize, folders: &[String]) -> Result<()> {
+        if folders.is_empty() {
+            return Ok(());
+        }
+
+        let account_name = self.accounts[account_index].config.name.clone();
+        if self.accounts[account_index].config.folders == folders {
+            return Ok(());
+        }
+
+        let current_folder = self.accounts[account_index].current_folder().to_owned();
+        self.accounts[account_index].config.folders = folders.to_vec();
+        self.accounts[account_index].selected_folder =
+            matching_folder_position(folders, &current_folder).unwrap_or(0);
+
+        if let Some(config_account) = self
+            .config
+            .accounts
+            .iter_mut()
+            .find(|account| account.name == account_name)
+        {
+            config_account.folders = folders.to_vec();
+            self.config.save_to(&self.config_path)?;
+        }
+
         Ok(())
     }
 
     fn send_current_draft(&mut self) -> Result<()> {
+        let account_index = self.selected_account;
         let account = self
             .current_account()
             .map(|account| account.config.clone())
@@ -1994,11 +2455,31 @@ impl App {
             body: self.compose.body.clone(),
         };
 
-        MailClient::send(&account, &draft)?;
+        let outcome = MailClient::send(&account, &draft)?;
 
         self.mode = Mode::Normal;
         self.compose = ComposeState::default();
-        self.status = format!("Sent message through {}.", account.sender_label());
+        let refresh_folder = outcome.appended_to.clone();
+        self.status = if let Some(error) = outcome.append_error {
+            format!(
+                "Sent message through {}, but saving the Sent copy failed: {error}",
+                account.sender_label()
+            )
+        } else if let Some(sent_folder) = outcome.appended_to {
+            format!(
+                "Sent message through {} and saved a copy to {}.",
+                account.sender_label(),
+                sent_folder
+            )
+        } else {
+            format!("Sent message through {}.", account.sender_label())
+        };
+
+        if let Some(sent_folder) = refresh_folder
+            && self.sync_job.is_none()
+        {
+            self.start_sync_for_account(account_index, Some(sent_folder), SyncReason::SentCopy)?;
+        }
         Ok(())
     }
 
@@ -2098,6 +2579,7 @@ impl App {
                 })?;
             }
         }
+        cache::remove_account(&self.cache_root, &removed_name)?;
 
         if self.accounts.is_empty() {
             self.selected_account = 0;
@@ -2143,6 +2625,17 @@ impl App {
         self.status = "Compose mode. Tab switches fields, Ctrl-S sends.".to_owned();
     }
 
+    fn enter_reader_mode(&mut self) {
+        if self.selected_message().is_none() {
+            self.status = "No message selected to open.".to_owned();
+            return;
+        }
+
+        self.mode = Mode::Reader;
+        self.reader_scroll = 0;
+        self.status = "Reader mode. Esc/q closes, j/k or mouse wheel scrolls.".to_owned();
+    }
+
     fn enter_account_setup_mode(&mut self) {
         self.mode = Mode::AccountSetup;
         self.account_setup = AccountSetupState::default();
@@ -2180,6 +2673,9 @@ impl App {
     }
 
     fn close_account_oauth(&mut self, status: &str) {
+        if let Some(cancellation) = &self.oauth_setup.cancellation {
+            cancellation.store(true, Ordering::Relaxed);
+        }
         self.mode = Mode::Normal;
         self.oauth_setup = OAuthSetupState::default();
         self.status = status.to_owned();
@@ -2204,13 +2700,15 @@ impl App {
             data_file: self.oauth_data_path_for(&self.oauth_setup.account_name),
         };
         let (sender, receiver) = mpsc::channel();
-        start_authorize_worker(request, sender);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        start_authorize_worker(request, sender, Arc::clone(&cancellation));
 
         self.oauth_setup.running = true;
         self.oauth_setup.progress_message =
             format!("Starting {} OAuth in your browser...", provider.label());
         self.oauth_setup.auth_url.clear();
         self.oauth_setup.receiver = Some(receiver);
+        self.oauth_setup.cancellation = Some(cancellation);
         self.status = self.oauth_setup.progress_message.clone();
         Ok(())
     }
@@ -2220,8 +2718,10 @@ impl App {
         self.focus = Pane::Messages;
         self.status =
             "Search mode. Type to filter the current folder; Enter keeps the filter.".to_owned();
+        let visible_count = self.message_visible_count();
         if let Some(account) = self.current_account_mut() {
             account.clamp_selected_message();
+            account.sync_message_scroll(visible_count);
         }
     }
 
@@ -2306,6 +2806,7 @@ impl App {
             .ok_or_else(|| anyhow::anyhow!("selected account state not found"))?;
         let previous_selected_folder = self.accounts[state_index].selected_folder;
         let previous_selected_message = self.accounts[state_index].selected_message;
+        let previous_message_scroll = self.accounts[state_index].message_scroll;
         let previous_synced_folder = self.accounts[state_index].synced_folder.clone();
         let previous_messages = self.accounts[state_index].messages.clone();
         let previous_query = self.accounts[state_index].message_query.clone();
@@ -2324,6 +2825,7 @@ impl App {
         account_state.selected_folder =
             previous_selected_folder.min(account_state.config.folders.len().saturating_sub(1));
         account_state.selected_message = previous_selected_message;
+        account_state.message_scroll = previous_message_scroll;
         account_state.synced_folder = previous_synced_folder;
         account_state.messages = previous_messages;
         account_state.message_query = previous_query;
@@ -2422,16 +2924,23 @@ impl App {
                     } else {
                         0
                     };
-                    account.invalidate_messages_if_needed();
                 }
+                self.load_cached_selected_folder();
             }
             Pane::Messages => {
+                let visible_count = self.message_visible_count();
                 if let Some(account) = self.current_account_mut() {
-                    account.selected_message = if bottom {
-                        account.filtered_message_count().saturating_sub(1)
+                    let count = account.filtered_message_count();
+                    if count == 0 {
+                        account.selected_message = 0;
+                        account.message_scroll = 0;
+                    } else if bottom {
+                        account.selected_message = count - 1;
+                        account.message_scroll = count.saturating_sub(visible_count.max(1));
                     } else {
-                        0
-                    };
+                        account.selected_message = 0;
+                        account.message_scroll = 0;
+                    }
                 }
             }
             Pane::Preview => {}
@@ -2453,6 +2962,7 @@ impl App {
     }
 
     fn move_folder_selection(&mut self, delta: isize) {
+        let mut folder = None;
         if let Some(account) = self.current_account_mut() {
             if account.config.folders.is_empty() {
                 return;
@@ -2460,45 +2970,71 @@ impl App {
 
             account.selected_folder =
                 wrap_index(account.selected_folder, account.config.folders.len(), delta);
-            let folder = account.current_folder().to_owned();
-            account.invalidate_messages_if_needed();
-            self.status = format!("Selected folder {folder}. Press s to sync.");
+            folder = Some(account.current_folder().to_owned());
+        }
+
+        if let Some(folder) = folder {
+            if self.load_cached_selected_folder() {
+                self.status = format!("Loaded cached {folder}. Press s to refresh.");
+            } else {
+                self.status = format!("Selected folder {folder}. Press s to sync.");
+            }
         }
     }
 
     fn move_message_selection(&mut self, delta: isize) {
+        let visible_count = self.message_visible_count();
         if let Some(account) = self.current_account_mut() {
-            if account.filtered_message_count() == 0 {
+            let count = account.filtered_message_count();
+            if count == 0 {
                 return;
             }
 
-            account.selected_message = wrap_index(
-                account.selected_message,
-                account.filtered_message_count(),
-                delta,
-            );
+            account.selected_message = wrap_index(account.selected_message, count, delta);
+            account.sync_message_scroll(visible_count);
+            self.reader_scroll = 0;
         }
     }
 
     fn set_folder_selection(&mut self, index: usize) {
+        let mut folder = None;
         if let Some(account) = self.current_account_mut() {
             if index >= account.config.folders.len() {
                 return;
             }
 
             account.selected_folder = index;
-            let folder = account.current_folder().to_owned();
-            account.invalidate_messages_if_needed();
-            self.status = format!("Selected folder {folder}. Press s to sync.");
+            folder = Some(account.current_folder().to_owned());
+        }
+
+        if let Some(folder) = folder {
+            if self.load_cached_selected_folder() {
+                self.status = format!("Loaded cached {folder}. Press s to refresh.");
+            } else {
+                self.status = format!("Selected folder {folder}. Press s to sync.");
+            }
         }
     }
 
     fn set_message_selection(&mut self, index: usize) {
+        let visible_count = self.message_visible_count();
         if let Some(account) = self.current_account_mut() {
             if index < account.filtered_message_count() {
                 account.selected_message = index;
+                account.sync_message_scroll(visible_count);
+                self.reader_scroll = 0;
             }
         }
+    }
+
+    fn scroll_reader(&mut self, delta: isize, amount: u16) {
+        let distance = amount as isize * delta;
+        self.reader_scroll = if distance.is_negative() {
+            self.reader_scroll
+                .saturating_sub(distance.unsigned_abs() as u16)
+        } else {
+            self.reader_scroll.saturating_add(distance as u16)
+        };
     }
 
     fn refresh_command_matches(&mut self) {
@@ -2526,6 +3062,14 @@ impl App {
         self.accounts.get_mut(self.selected_account)
     }
 
+    fn load_cached_selected_folder(&mut self) -> bool {
+        let Some(account) = self.accounts.get_mut(self.selected_account) else {
+            return false;
+        };
+
+        load_cached_folder_into_state(&self.cache_root, account)
+    }
+
     fn selected_message(&self) -> Option<&EmailMessage> {
         let account = self.current_account()?;
         let index = *account
@@ -2534,17 +3078,48 @@ impl App {
         account.messages.get(index)
     }
 
+    fn message_visible_count(&self) -> usize {
+        let rows = inner_rect(self.hitboxes.messages).height / MESSAGE_ROW_HEIGHT;
+        rows.max(1) as usize
+    }
+
+    fn message_index_from_click(&self, y: u16) -> Option<usize> {
+        let account = self.current_account()?;
+        let count = account.filtered_message_count();
+        if count == 0 {
+            return None;
+        }
+
+        let offset = message_scroll_for_selection(
+            account.message_scroll,
+            account.selected_message,
+            count,
+            self.message_visible_count(),
+        );
+        fixed_height_list_index_from_click(
+            inner_rect(self.hitboxes.messages),
+            y,
+            MESSAGE_ROW_HEIGHT,
+            offset,
+            count,
+        )
+    }
+
     fn account_row_heights(&self) -> Vec<u16> {
         self.accounts
             .iter()
-            .map(|account| if account.last_sync.is_some() { 4 } else { 3 })
+            .map(|account| {
+                let mut height = if account.last_sync.is_some() { 4 } else { 3 };
+                if self
+                    .sync_job
+                    .as_ref()
+                    .is_some_and(|job| job.account_name == account.config.name)
+                {
+                    height += 1;
+                }
+                height
+            })
             .collect()
-    }
-
-    fn message_row_heights(&self) -> Vec<u16> {
-        self.current_account()
-            .map(|account| vec![3; account.filtered_message_count()])
-            .unwrap_or_default()
     }
 
     fn current_compose_field_mut(&mut self) -> &mut String {
@@ -2572,6 +3147,7 @@ impl App {
             Mode::Normal => "normal",
             Mode::Command => "command",
             Mode::Compose => "compose",
+            Mode::Reader => "reader",
             Mode::Search => "search",
             Mode::AccountSetup => "account-setup",
             Mode::AccountOAuth => "account-oauth",
@@ -2750,19 +3326,13 @@ impl AccountState {
             .unwrap_or("INBOX")
     }
 
-    fn invalidate_messages_if_needed(&mut self) {
-        if self
-            .synced_folder
-            .as_deref()
-            .is_some_and(|folder| folder == self.current_folder())
-        {
-            return;
-        }
-
+    fn clear_messages(&mut self) {
         self.messages.clear();
         self.selected_message = 0;
+        self.message_scroll = 0;
         self.synced_folder = None;
         self.message_query.clear();
+        self.last_sync = None;
     }
 
     fn filtered_message_indices(&self) -> Vec<usize> {
@@ -2795,9 +3365,19 @@ impl AccountState {
         let count = self.filtered_message_count();
         if count == 0 {
             self.selected_message = 0;
+            self.message_scroll = 0;
         } else if self.selected_message >= count {
             self.selected_message = count - 1;
         }
+    }
+
+    fn sync_message_scroll(&mut self, visible_count: usize) {
+        self.message_scroll = message_scroll_for_selection(
+            self.message_scroll,
+            self.selected_message,
+            self.filtered_message_count(),
+            visible_count,
+        );
     }
 }
 
@@ -2866,6 +3446,7 @@ impl Default for OAuthSetupState {
             progress_message: String::new(),
             auth_url: String::new(),
             receiver: None,
+            cancellation: None,
         }
     }
 }
@@ -3130,6 +3711,7 @@ impl OAuthSetupState {
             progress_message: String::new(),
             auth_url: String::new(),
             receiver: None,
+            cancellation: None,
         }
     }
 
@@ -3203,11 +3785,33 @@ fn resolve_account_state(account: &AccountConfig) -> Result<AccountState> {
         config: account.resolve()?,
         selected_folder: 0,
         selected_message: 0,
+        message_scroll: 0,
         synced_folder: None,
         messages: Vec::new(),
         message_query: String::new(),
         last_sync: None,
     })
+}
+
+fn load_cached_folder_into_state(cache_root: &PathBuf, account: &mut AccountState) -> bool {
+    let account_name = account.config.name.clone();
+    let folder = account.current_folder().to_owned();
+
+    match cache::load_folder(cache_root, &account_name, &folder) {
+        Ok(Some(cached)) => {
+            account.messages = cached.messages;
+            account.selected_message = 0;
+            account.message_scroll = 0;
+            account.synced_folder = Some(cached.folder);
+            account.message_query.clear();
+            account.last_sync = Some(cached.last_sync);
+            true
+        }
+        Ok(None) | Err(_) => {
+            account.clear_messages();
+            false
+        }
+    }
 }
 
 fn wrap_index(current: usize, len: usize, delta: isize) -> usize {
@@ -3283,6 +3887,212 @@ fn confirm_block(selected: bool) -> Block<'static> {
         .style(popup_style())
 }
 
+fn reader_block(title: &str) -> Block<'_> {
+    Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(
+            Style::new()
+                .fg(Color::Rgb(96, 165, 250))
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(reader_style())
+}
+
+fn message_text(message: &EmailMessage, full: bool) -> Text<'static> {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "Subject: ",
+                Style::new()
+                    .fg(Color::Rgb(250, 204, 21))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                message.subject.clone(),
+                Style::new()
+                    .fg(Color::Rgb(255, 247, 237))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "From: ",
+                Style::new()
+                    .fg(Color::Rgb(94, 234, 212))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                message.from.clone(),
+                Style::new().fg(Color::Rgb(204, 251, 241)),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Date: ",
+                Style::new()
+                    .fg(Color::Rgb(125, 211, 252))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                message.date.clone(),
+                Style::new().fg(Color::Rgb(186, 230, 253)),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "UID: ",
+                Style::new()
+                    .fg(Color::Rgb(244, 162, 97))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                message.uid.to_string(),
+                Style::new().fg(Color::Rgb(254, 215, 170)),
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    if full {
+        lines.push(
+            Line::from("Message").style(
+                Style::new()
+                    .fg(Color::Rgb(233, 196, 106))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        );
+        lines.push(Line::from(""));
+    }
+
+    for raw in message.body.lines() {
+        lines.push(style_body_line(raw));
+    }
+
+    Text::from(lines)
+}
+
+fn style_body_line(raw: &str) -> Line<'static> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Line::from("");
+    }
+
+    if trimmed.starts_with('>') {
+        return Line::from(raw.to_owned()).style(
+            Style::new()
+                .fg(Color::Rgb(134, 239, 172))
+                .add_modifier(Modifier::ITALIC),
+        );
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("unsubscribe") || lower.contains("privacy policy") {
+        return Line::from(raw.to_owned()).style(Style::new().fg(Color::Rgb(100, 116, 139)));
+    }
+
+    if lower.contains("urgent")
+        || lower.contains("warning")
+        || lower.contains("security")
+        || lower.contains("verify")
+    {
+        return Line::from(link_spans(raw, Style::new().fg(Color::Rgb(254, 226, 226)))).style(
+            Style::new()
+                .fg(Color::Rgb(254, 226, 226))
+                .bg(Color::Rgb(127, 29, 29)),
+        );
+    }
+
+    if looks_like_heading(trimmed) {
+        return Line::from(raw.to_owned()).style(
+            Style::new()
+                .fg(Color::Rgb(253, 230, 138))
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+
+    let base = if trimmed.starts_with('-') || trimmed.starts_with('*') {
+        Style::new().fg(Color::Rgb(226, 232, 240))
+    } else {
+        Style::new().fg(Color::Rgb(203, 213, 225))
+    };
+
+    Line::from(link_spans(raw, base))
+}
+
+fn link_spans(raw: &str, base: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut first = true;
+
+    for token in raw.split_whitespace() {
+        if !first {
+            spans.push(Span::raw(" "));
+        }
+        first = false;
+
+        let style = if token.starts_with("http://")
+            || token.starts_with("https://")
+            || token.starts_with("mailto:")
+        {
+            Style::new()
+                .fg(Color::Rgb(56, 189, 248))
+                .add_modifier(Modifier::UNDERLINED)
+        } else {
+            base
+        };
+        push_breakable_token_spans(&mut spans, token, style);
+    }
+
+    spans
+}
+
+fn push_breakable_token_spans(spans: &mut Vec<Span<'static>>, token: &str, style: Style) {
+    if token.chars().count() <= LONG_TOKEN_BREAK_CHARS {
+        spans.push(Span::styled(token.to_owned(), style));
+        return;
+    }
+
+    let mut chunk = String::new();
+    for ch in token.chars() {
+        chunk.push(ch);
+        if chunk.chars().count() >= LONG_TOKEN_BREAK_CHARS {
+            spans.push(Span::styled(std::mem::take(&mut chunk), style));
+            spans.push(Span::raw(" "));
+        }
+    }
+
+    if !chunk.is_empty() {
+        spans.push(Span::styled(chunk, style));
+    } else if spans.last().is_some_and(|span| span.content == " ") {
+        spans.pop();
+    }
+}
+
+fn looks_like_heading(trimmed: &str) -> bool {
+    let len = trimmed.chars().count();
+    len <= 72
+        && len > 3
+        && !trimmed.ends_with('.')
+        && !trimmed.ends_with(',')
+        && !trimmed.contains("://")
+        && (trimmed.starts_with('#')
+            || trimmed.chars().any(char::is_alphabetic)
+                && trimmed.chars().filter(|ch| ch.is_uppercase()).count() >= 2)
+}
+
+fn truncate_title(raw: &str, max_chars: usize) -> String {
+    if raw.chars().count() <= max_chars {
+        return raw.to_owned();
+    }
+
+    let mut out = raw
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    out
+}
+
 fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
     x >= rect.x
         && x < rect.x.saturating_add(rect.width)
@@ -3317,6 +4127,46 @@ fn list_index_from_click(inner: Rect, y: u16, item_heights: &[u16]) -> Option<us
     }
 
     None
+}
+
+fn fixed_height_list_index_from_click(
+    inner: Rect,
+    y: u16,
+    item_height: u16,
+    offset: usize,
+    total: usize,
+) -> Option<usize> {
+    if item_height == 0 || total == 0 || !rect_contains(inner, inner.x, y) || y < inner.y {
+        return None;
+    }
+
+    let visible_index = (y - inner.y) / item_height;
+    let index = offset.saturating_add(visible_index as usize);
+    (index < total).then_some(index)
+}
+
+fn message_scroll_for_selection(
+    scroll: usize,
+    selected: usize,
+    total: usize,
+    visible_count: usize,
+) -> usize {
+    if total == 0 {
+        return 0;
+    }
+
+    let visible_count = visible_count.max(1);
+    let selected = selected.min(total - 1);
+    let max_scroll = total.saturating_sub(visible_count);
+    let scroll = scroll.min(max_scroll);
+
+    if selected < scroll {
+        selected
+    } else if selected >= scroll.saturating_add(visible_count) {
+        selected.saturating_add(1).saturating_sub(visible_count)
+    } else {
+        scroll
+    }
 }
 
 fn mask_secret(secret: &str) -> String {
@@ -3354,6 +4204,59 @@ fn push_candidate(seen: &mut BTreeSet<String>, out: &mut Vec<String>, candidate:
 fn non_empty_option(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+fn matching_folder_position(folders: &[String], requested: &str) -> Option<usize> {
+    folders
+        .iter()
+        .position(|folder| folder.eq_ignore_ascii_case(requested))
+        .or_else(|| {
+            let requested_role = special_folder_role(requested)?;
+            folders
+                .iter()
+                .position(|folder| special_folder_role(folder) == Some(requested_role))
+        })
+}
+
+fn sync_reason_label(reason: SyncReason) -> &'static str {
+    match reason {
+        SyncReason::Manual => "sync",
+        SyncReason::Auto => "auto",
+        SyncReason::SentCopy => "sent",
+        SyncReason::LoadOlder => "older",
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpecialFolderRole {
+    Inbox,
+    Sent,
+    Drafts,
+    Archive,
+    Trash,
+}
+
+fn special_folder_role(folder: &str) -> Option<SpecialFolderRole> {
+    let lower = folder.to_ascii_lowercase();
+    let leaf = lower
+        .rsplit(['/', '.', '\\'])
+        .next()
+        .unwrap_or(lower.as_str())
+        .trim();
+
+    if lower == "inbox" || leaf == "inbox" {
+        Some(SpecialFolderRole::Inbox)
+    } else if leaf.contains("sent") || lower.contains("/sent") || lower.contains("\\sent") {
+        Some(SpecialFolderRole::Sent)
+    } else if leaf.contains("draft") {
+        Some(SpecialFolderRole::Drafts)
+    } else if leaf.contains("archive") || leaf == "all mail" || lower.ends_with("/all mail") {
+        Some(SpecialFolderRole::Archive)
+    } else if leaf.contains("trash") || leaf.contains("deleted") || leaf == "bin" {
+        Some(SpecialFolderRole::Trash)
+    } else {
+        None
+    }
 }
 
 fn slugify(raw: &str) -> String {
@@ -3416,4 +4319,38 @@ fn popup_style() -> Style {
     Style::new()
         .bg(Color::Rgb(11, 18, 32))
         .fg(Color::Rgb(241, 245, 249))
+}
+
+fn reader_style() -> Style {
+    Style::new()
+        .bg(Color::Rgb(8, 13, 24))
+        .fg(Color::Rgb(226, 232, 240))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_scroll_stays_when_selection_moves_inside_view() {
+        assert_eq!(message_scroll_for_selection(10, 12, 100, 5), 10);
+    }
+
+    #[test]
+    fn message_scroll_moves_only_after_selection_crosses_top_boundary() {
+        assert_eq!(message_scroll_for_selection(10, 10, 100, 5), 10);
+        assert_eq!(message_scroll_for_selection(10, 9, 100, 5), 9);
+    }
+
+    #[test]
+    fn message_scroll_moves_only_after_selection_crosses_bottom_boundary() {
+        assert_eq!(message_scroll_for_selection(10, 14, 100, 5), 10);
+        assert_eq!(message_scroll_for_selection(10, 15, 100, 5), 11);
+    }
+
+    #[test]
+    fn message_scroll_clamps_when_message_count_shrinks() {
+        assert_eq!(message_scroll_for_selection(30, 30, 12, 5), 7);
+        assert_eq!(message_scroll_for_selection(30, 30, 0, 5), 0);
+    }
 }

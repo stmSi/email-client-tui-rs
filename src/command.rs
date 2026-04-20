@@ -4,6 +4,7 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppCommand {
     Sync,
+    LoadOlder,
     AddAccount,
     RemoveAccount,
     AuthorizeAccount,
@@ -41,6 +42,12 @@ const COMMANDS: &[CommandSpec] = &[
         description: "Fetch mail for the selected account and folder",
         aliases: &["refresh", "check-mail"],
         action: AppCommand::Sync,
+    },
+    CommandSpec {
+        name: "load-older",
+        description: "Load the next older page of messages for the selected folder",
+        aliases: &["older", "history", "more-mail", "more"],
+        action: AppCommand::LoadOlder,
     },
     CommandSpec {
         name: "add-account",

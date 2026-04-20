@@ -3,7 +3,11 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc::Sender;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc::Sender,
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -88,9 +92,11 @@ struct ProviderSpec {
 pub fn start_authorize_worker(
     request: OAuthAuthorizeRequest,
     sender: Sender<OAuthAuthorizeUpdate>,
+    cancelled: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
-        let result = authorize_account(&request, &sender).map_err(|error| format!("{error:#}"));
+        let result =
+            authorize_account(&request, &sender, &cancelled).map_err(|error| format!("{error:#}"));
         let _ = sender.send(OAuthAuthorizeUpdate::Complete(result));
     });
 }
@@ -158,16 +164,30 @@ pub fn find_google_desktop_oauth_client(dir: &Path) -> Result<Option<StoredOAuth
 fn load_google_desktop_oauth_client_file(path: &Path) -> Result<StoredOAuthClient> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read Google OAuth client file {}", path.display()))?;
-    let value = serde_json::from_str::<Value>(&raw)
-        .with_context(|| format!("failed to parse Google OAuth client file {}", path.display()))?;
+    let value = serde_json::from_str::<Value>(&raw).with_context(|| {
+        format!(
+            "failed to parse Google OAuth client file {}",
+            path.display()
+        )
+    })?;
     let installed = value
         .get("installed")
         .and_then(Value::as_object)
-        .ok_or_else(|| anyhow!("Google OAuth client file {} is missing 'installed'", path.display()))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "Google OAuth client file {} is missing 'installed'",
+                path.display()
+            )
+        })?;
     let client_id = installed
         .get("client_id")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("Google OAuth client file {} is missing client_id", path.display()))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "Google OAuth client file {} is missing client_id",
+                path.display()
+            )
+        })?;
     let client_secret = installed
         .get("client_secret")
         .and_then(Value::as_str)
@@ -203,6 +223,7 @@ pub fn load_access_token(oauth: &ResolvedOAuthConfig) -> Result<String> {
 fn authorize_account(
     request: &OAuthAuthorizeRequest,
     sender: &Sender<OAuthAuthorizeUpdate>,
+    cancelled: &AtomicBool,
 ) -> Result<AuthorizedAccount> {
     let spec = provider_spec(request.provider);
     let listener =
@@ -216,7 +237,9 @@ fn authorize_account(
         .port();
     let redirect_uri = match request.provider {
         OAuthProviderKind::GoogleMail => format!("http://127.0.0.1:{port}"),
-        OAuthProviderKind::MicrosoftMail => format!("http://localhost:{port}{}", spec.redirect_path),
+        OAuthProviderKind::MicrosoftMail => {
+            format!("http://localhost:{port}{}", spec.redirect_path)
+        }
     };
     let expected_path = match request.provider {
         OAuthProviderKind::GoogleMail => "/",
@@ -263,12 +286,19 @@ fn authorize_account(
         auth_url: authorize_url.to_string(),
     });
 
-    let code = wait_for_callback(&listener, csrf_state.secret(), expected_path)?;
+    let code = wait_for_callback(&listener, csrf_state.secret(), expected_path, cancelled)?;
+    if cancelled.load(Ordering::Relaxed) {
+        bail!("OAuth authorization cancelled");
+    }
+
     let token = client
         .exchange_code(code)
         .set_pkce_verifier(pkce_verifier)
         .request(&http_client)
         .context("failed to exchange OAuth authorization code for tokens")?;
+    if cancelled.load(Ordering::Relaxed) {
+        bail!("OAuth authorization cancelled");
+    }
 
     let refresh_token = token
         .refresh_token()
@@ -361,10 +391,15 @@ fn wait_for_callback(
     listener: &TcpListener,
     expected_state: &str,
     expected_path: &str,
+    cancelled: &AtomicBool,
 ) -> Result<AuthorizationCode> {
     let deadline = Instant::now() + CALLBACK_TIMEOUT;
 
     loop {
+        if cancelled.load(Ordering::Relaxed) {
+            bail!("OAuth authorization cancelled");
+        }
+
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let mut reader = BufReader::new(&stream);
@@ -430,6 +465,9 @@ fn wait_for_callback(
                 return Ok(code);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if cancelled.load(Ordering::Relaxed) {
+                    bail!("OAuth authorization cancelled");
+                }
                 if Instant::now() >= deadline {
                     bail!("timed out waiting for the OAuth browser callback");
                 }

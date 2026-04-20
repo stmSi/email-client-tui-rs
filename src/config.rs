@@ -6,12 +6,21 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+const DEFAULT_FETCH_LIMIT: usize = 100;
+const MIN_FETCH_LIMIT: usize = 25;
+const MAX_FETCH_LIMIT: usize = 1000;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_account: Option<String>,
+    #[serde(
+        default = "default_fetch_limit",
+        deserialize_with = "deserialize_fetch_limit"
+    )]
+    pub fetch_limit: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -173,10 +182,26 @@ impl AppConfig {
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
 
-        let raw = toml::to_string_pretty(self).context("failed to serialize config")?;
+        let mut config = self.clone();
+        config.fetch_limit = config.fetch_limit();
+        let raw = toml::to_string_pretty(&config).context("failed to serialize config")?;
         fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))?;
         tighten_permissions(path)?;
         Ok(())
+    }
+
+    pub fn fetch_limit(&self) -> usize {
+        clamp_fetch_limit(self.fetch_limit)
+    }
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            accounts: Vec::new(),
+            default_account: None,
+            fetch_limit: default_fetch_limit(),
+        }
     }
 }
 
@@ -546,6 +571,22 @@ fn default_folders() -> Vec<String> {
         .collect()
 }
 
+fn default_fetch_limit() -> usize {
+    DEFAULT_FETCH_LIMIT
+}
+
+fn deserialize_fetch_limit<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = usize::deserialize(deserializer)?;
+    Ok(clamp_fetch_limit(value))
+}
+
+fn clamp_fetch_limit(value: usize) -> usize {
+    value.clamp(MIN_FETCH_LIMIT, MAX_FETCH_LIMIT)
+}
+
 fn default_config_path() -> Result<PathBuf> {
     let config_root = dirs::config_dir().context("could not resolve config directory")?;
     Ok(config_root.join("email-client-tui-rs").join("config.toml"))
@@ -606,6 +647,25 @@ mod tests {
         assert_eq!(resolved.login, "me@example.com");
         assert_eq!(resolved.folders[0], "INBOX");
         assert_eq!(resolved.provider, ProviderKind::Gmail);
+    }
+
+    #[test]
+    fn app_config_fetch_limit_defaults_to_100() {
+        let config = toml::from_str::<AppConfig>("").expect("empty config should parse");
+        assert_eq!(config.fetch_limit(), 100);
+    }
+
+    #[test]
+    fn app_config_fetch_limit_is_clamped() {
+        let low =
+            toml::from_str::<AppConfig>("fetch_limit = 5").expect("low fetch_limit should parse");
+        let high = toml::from_str::<AppConfig>("fetch_limit = 50000")
+            .expect("high fetch_limit should parse");
+
+        assert_eq!(low.fetch_limit(), 25);
+        assert_eq!(low.fetch_limit, 25);
+        assert_eq!(high.fetch_limit(), 1000);
+        assert_eq!(high.fetch_limit, 1000);
     }
 
     #[test]
